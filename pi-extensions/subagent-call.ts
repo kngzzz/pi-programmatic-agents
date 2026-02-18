@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -19,6 +19,15 @@ const DEFAULT_MAX_TURNS = 8;
 const MAX_TIMEOUT_SECONDS = 900;
 const MAX_TURNS = 32;
 const MAX_TRACE_ITEMS = 120;
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 4;
+const MAX_ARTIFACTS = 20;
+
+const MAX_STDERR_BYTES = 64 * 1024; // 64KB cap on stderr accumulation
+const SAFE_ENV_PASSTHROUGH = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+const SCRUBBED_ENV_PATTERN = /(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$/;
+const POISONED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+let activeSubagentProcesses = 0;
 
 const OutputModeSchema = StringEnum(["json", "text"] as const, {
 	description: "Final output mode returned to the parent agent",
@@ -312,10 +321,19 @@ function setDotPathValue(target: Record<string, any>, dotPath: string, value: un
 	const parts = normalized.split(".").filter(Boolean);
 	if (parts.length === 0) return;
 
-	let cursor: Record<string, any> = target;
+	// Guard against prototype pollution
+	for (const part of parts) {
+		if (POISONED_KEYS.has(part)) return;
+	}
+
+	let cursor: any = target;
 	for (let i = 0; i < parts.length - 1; i++) {
 		const key = parts[i];
-		if (!cursor[key] || typeof cursor[key] !== "object") cursor[key] = {};
+		if (!cursor[key] || typeof cursor[key] !== "object") {
+			// Create array if next segment is a numeric index, object otherwise
+			const nextKey = parts[i + 1];
+			cursor[key] = /^\d+$/.test(nextKey) ? [] : {};
+		}
 		cursor = cursor[key];
 	}
 	cursor[parts[parts.length - 1]] = value;
@@ -364,8 +382,10 @@ function extractJsonPayload(rawText: string): { value?: unknown; error?: string 
 		if (parsed.ok) return { value: parsed.value };
 	}
 
+	let directError: string | undefined;
+	if ("error" in direct) directError = direct.error;
 	return {
-		error: `Unable to parse JSON output. Parse error: ${direct.error ?? "unknown"}`,
+		error: `Unable to parse JSON output. Parse error: ${directError ?? "unknown"}`,
 	};
 }
 
@@ -432,6 +452,37 @@ function formatUsage(usage: UsageStats): string {
 	return parts.join(" ");
 }
 
+function buildSubagentEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value === undefined) continue;
+		if (SCRUBBED_ENV_PATTERN.test(key) && !SAFE_ENV_PASSTHROUGH.has(key)) continue;
+		env[key] = value;
+	}
+	return env;
+}
+
+function retrySuggestion(turnsUsed: number, maxTurns: number): string {
+	const basedOnTurns = turnsUsed > 0 ? turnsUsed + 2 : maxTurns + 2;
+	const suggestedTurns = Math.max(maxTurns + 1, Math.min(MAX_TURNS, basedOnTurns));
+	if (suggestedTurns <= maxTurns) return "";
+	return `Retry suggestion: increase maxTurns to ${suggestedTurns}.`;
+}
+
+function findJsonInAssistantOutputs(outputs: string[]): { value?: unknown; sourceText?: string; error?: string } {
+	let latestError: string | undefined;
+	for (let i = outputs.length - 1; i >= 0; i--) {
+		const candidate = outputs[i]?.trim() ?? "";
+		if (!candidate) continue;
+		const parsed = extractJsonPayload(candidate);
+		if (!parsed.error) {
+			return { value: parsed.value, sourceText: candidate };
+		}
+		if (!latestError) latestError = parsed.error;
+	}
+	return { error: latestError ?? "Sub-agent returned empty output; expected JSON" };
+}
+
 async function runSubagent(
 	params: {
 		cwd: string;
@@ -445,7 +496,7 @@ async function runSubagent(
 		taskPrompt: string;
 	},
 	signal: AbortSignal | undefined,
-	onUpdate: ((update: { content?: Array<{ type: "text"; text: string }>; details?: Record<string, unknown> }) => void) | undefined,
+	onUpdate: ((update: any) => void) | undefined,
 ): Promise<RunResult> {
 	const usage: UsageStats = {
 		input: 0,
@@ -495,6 +546,7 @@ async function runSubagent(
 				cwd: params.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: buildSubagentEnv(),
 			});
 
 			let stdoutBuffer = "";
@@ -511,12 +563,15 @@ async function runSubagent(
 				});
 			};
 
+			let childExited = false;
 			const killChild = (reason: TerminationReason) => {
 				if (terminationReason) return;
 				terminationReason = reason;
 				child.kill("SIGTERM");
 				setTimeout(() => {
-					if (!child.killed) child.kill("SIGKILL");
+					if (!childExited) {
+						try { child.kill("SIGKILL"); } catch { /* already dead */ }
+					}
 				}, 5000);
 			};
 
@@ -586,7 +641,12 @@ async function runSubagent(
 			});
 
 			child.stderr.on("data", (chunk) => {
-				stderr += chunk.toString();
+				if (stderr.length < MAX_STDERR_BYTES) {
+					stderr += chunk.toString();
+					if (stderr.length > MAX_STDERR_BYTES) {
+						stderr = stderr.slice(0, MAX_STDERR_BYTES) + "\n[stderr truncated]";
+					}
+				}
 			});
 
 			if (params.timeoutSeconds > 0) {
@@ -598,15 +658,18 @@ async function runSubagent(
 			signal?.addEventListener("abort", abortHandler, { once: true });
 
 			child.on("close", (code) => {
+				childExited = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				signal?.removeEventListener("abort", abortHandler);
 				if (stdoutBuffer.trim()) processLine(stdoutBuffer);
 				resolve(code ?? 0);
 			});
 
-			child.on("error", () => {
+			child.on("error", (err) => {
+				childExited = true;
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				signal?.removeEventListener("abort", abortHandler);
+				errorMessage = err?.message ?? "Spawn failed";
 				resolve(1);
 			});
 		});
@@ -628,6 +691,28 @@ async function runSubagent(
 	}
 }
 
+function cleanupOldArtifacts(maxArtifacts: number): void {
+	if (maxArtifacts <= 0) return;
+	try {
+		const baseDir = os.tmpdir();
+		const artifactDirs = readdirSync(baseDir)
+			.filter((name) => name.startsWith("pi-subagent-artifact-"))
+			.map((name) => {
+				const dirPath = path.join(baseDir, name);
+				const mtimeMs = statSync(dirPath).mtimeMs;
+				return { dirPath, mtimeMs };
+			})
+			.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+		if (artifactDirs.length <= maxArtifacts) return;
+		for (const artifact of artifactDirs.slice(maxArtifacts)) {
+			rmSync(artifact.dirPath, { recursive: true, force: true });
+		}
+	} catch {
+		// Ignore cleanup errors.
+	}
+}
+
 function writeArtifact(run: {
 	params: SubagentCallParams;
 	resolvedCwd: string;
@@ -641,18 +726,40 @@ function writeArtifact(run: {
 	try {
 		const dir = mkdtempSync(path.join(os.tmpdir(), "pi-subagent-artifact-"));
 		const filePath = path.join(dir, "run.json");
+		// Redact params for artifact — keep objective/outputMode/requiredKeys, omit instructions/outputSchema
+		const safeParams = {
+			objective: run.params.objective,
+			outputMode: run.params.outputMode,
+			requiredKeys: run.params.requiredKeys,
+			project: run.params.project,
+			model: run.params.model,
+			tools: run.params.tools,
+			timeoutSeconds: run.params.timeoutSeconds,
+			maxTurns: run.params.maxTurns,
+		};
+		// Redact result — drop raw stderr (may contain env info)
+		const safeResult = {
+			exitCode: run.result.exitCode,
+			terminationReason: run.result.terminationReason,
+			assistantTurns: run.result.assistantTurns,
+			model: run.result.model,
+			stopReason: run.result.stopReason,
+			errorMessage: run.result.errorMessage,
+			usage: run.result.usage,
+			assistantOutputs: run.result.assistantOutputs,
+			trace: run.result.trace,
+		};
 		const payload = {
 			timestamp: new Date().toISOString(),
-			params: run.params,
+			params: safeParams,
 			resolvedCwd: run.resolvedCwd,
-			systemPrompt: run.systemPrompt,
-			taskPrompt: run.taskPrompt,
-			result: run.result,
+			result: safeResult,
 			processedOutput: run.processedOutput,
 			parseError: run.parseError,
 			missingKeys: run.missingKeys,
 		};
 		writeFileSync(filePath, JSON.stringify(payload, null, 2), "utf-8");
+		cleanupOldArtifacts(MAX_ARTIFACTS);
 		return filePath;
 	} catch {
 		return undefined;
@@ -673,12 +780,32 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
 			const params = rawParams as SubagentCallParams;
+
+			// Pre-run validation
+			if (!params.objective || !params.objective.trim()) {
+				return {
+					content: [{ type: "text", text: "Sub-agent rejected: objective is required and cannot be empty." }],
+					details: { status: "error", errorMessage: "Empty objective" },
+					isError: true,
+				};
+			}
+
 			const outputMode: OutputMode = params.outputMode ?? "json";
 			const timeoutSeconds = clamp(params.timeoutSeconds, DEFAULT_TIMEOUT_SECONDS, 5, MAX_TIMEOUT_SECONDS);
 			const maxTurns = clamp(params.maxTurns, DEFAULT_MAX_TURNS, 1, MAX_TURNS);
 			const includeRawOutput = params.includeRawOutput ?? false;
 
-			const resolvedCwd = resolveWorkingDirectory(ctx.cwd, params.cwd);
+			let resolvedCwd: string;
+			try {
+				resolvedCwd = resolveWorkingDirectory(ctx.cwd, params.cwd);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : "Invalid working directory";
+				return {
+					content: [{ type: "text", text: `Sub-agent rejected: ${msg}` }],
+					details: { status: "error", errorMessage: msg },
+					isError: true,
+				};
+			}
 			const includeFiles = normalizeFileArgs(resolvedCwd, params.includeFiles);
 			const tools = normalizeTools(params.tools);
 
@@ -699,26 +826,71 @@ export default function (pi: ExtensionAPI) {
 				includeFiles,
 			});
 
-			onUpdate?.({
-				content: [{ type: "text", text: "Launching sub-agent function..." }],
-				details: { status: "starting" },
-			});
+			if (activeSubagentProcesses >= DEFAULT_MAX_CONCURRENT_SUBAGENTS) {
+				const concurrencyMessage = [
+					"Sub-agent execution rejected.",
+					`Concurrency limit reached: ${activeSubagentProcesses}/${DEFAULT_MAX_CONCURRENT_SUBAGENTS} active sub-agent processes.`,
+					"Retry once one of the active sub-agent calls completes.",
+				].join("\n");
 
-			const run = await runSubagent(
-				{
+				const details: ToolDetails = {
+					status: "error",
+					objective: params.objective,
+					outputMode,
 					cwd: resolvedCwd,
-					includeFiles,
 					model: params.model,
 					thinking: params.thinking,
 					tools,
 					timeoutSeconds,
 					maxTurns,
-					systemPrompt,
-					taskPrompt,
-				},
-				signal,
-				onUpdate,
-			);
+					assistantTurns: 0,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						cost: 0,
+						contextTokens: 0,
+						turns: 0,
+					},
+					errorMessage: concurrencyMessage,
+					projection: params.project,
+					trace: [],
+				};
+
+				return {
+					content: [{ type: "text", text: concurrencyMessage }],
+					details,
+					isError: true,
+				};
+			}
+
+			onUpdate?.({
+				content: [{ type: "text", text: "Launching sub-agent function..." }],
+				details: { status: "starting" },
+			});
+
+			activeSubagentProcesses += 1;
+			let run: RunResult;
+			try {
+				run = await runSubagent(
+					{
+						cwd: resolvedCwd,
+						includeFiles,
+						model: params.model,
+						thinking: params.thinking,
+						tools,
+						timeoutSeconds,
+						maxTurns,
+						systemPrompt,
+						taskPrompt,
+					},
+					signal,
+					onUpdate,
+				);
+			} finally {
+				activeSubagentProcesses = Math.max(0, activeSubagentProcesses - 1);
+			}
 
 			const lastOutput = run.assistantOutputs[run.assistantOutputs.length - 1]?.trim() ?? "";
 			const runError =
@@ -734,15 +906,20 @@ export default function (pi: ExtensionAPI) {
 			let processedOutput: unknown;
 
 			if (outputMode === "json") {
-				const parsed = extractJsonPayload(lastOutput);
+				const parsed = findJsonInAssistantOutputs(run.assistantOutputs);
+				const matchedOutput = parsed.sourceText ?? lastOutput;
 				if (parsed.error) {
 					parseError = parsed.error;
 					isError = true;
+					const retry = retrySuggestion(run.assistantTurns, maxTurns);
 					contentText = [
 						"Sub-agent JSON contract violation.",
 						parseError,
-						lastOutput ? `Raw output preview:\n${lastOutput}` : "(no output)",
-					].join("\n\n");
+						retry,
+						matchedOutput ? `Raw output preview:\n${matchedOutput}` : "(no output)",
+					]
+						.filter(Boolean)
+						.join("\n\n");
 				} else {
 					missingKeys = findMissingRequiredKeys(parsed.value, params.requiredKeys);
 					if (missingKeys.length > 0) {
@@ -750,7 +927,7 @@ export default function (pi: ExtensionAPI) {
 						contentText = [
 							"Sub-agent JSON output is missing required keys.",
 							`Missing: ${missingKeys.join(", ")}`,
-							`Raw output:\n${lastOutput || "(no output)"}`,
+							`Raw output:\n${matchedOutput || "(no output)"}`,
 						].join("\n\n");
 					} else {
 						processedOutput = projectObject(parsed.value, params.project);
@@ -774,6 +951,10 @@ export default function (pi: ExtensionAPI) {
 				if (run.stopReason) errorBits.push(`Stop reason: ${run.stopReason}`);
 				if (run.errorMessage) errorBits.push(`Error: ${run.errorMessage}`);
 				if (run.stderr.trim()) errorBits.push(`stderr: ${trimPreview(run.stderr, 600)}`);
+				if (run.terminationReason === "max_turns_exceeded") {
+					const retry = retrySuggestion(run.assistantTurns, maxTurns);
+					if (retry) errorBits.push(retry);
+				}
 				errorBits.push("", "Last output:", lastOutput || "(no output)");
 				contentText = errorBits.join("\n");
 			}
