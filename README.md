@@ -42,7 +42,7 @@ The extension adds a single tool: **`subagent_call`**
 1. Parent agent composes the call — objective, output contract, tool allowlist, model
 2. Extension spawns an isolated `pi` subprocess (`--no-session --no-extensions --no-skills`)
 3. Sub-agent works independently using its allowed tools
-4. Extension validates the output against the contract (required keys, JSON schema)
+4. Extension validates required JSON keys against the contract (`requiredKeys`) and treats `outputSchema` as prompt-level guidance
 5. Extension projects only the requested fields back to the parent
 6. Parent receives minimal, contracted output — everything else stays in the sub-agent's context
 
@@ -69,11 +69,11 @@ Parent agent                    Sub-agent (isolated pi process)
 | `objective` | ✅ | What the sub-agent should accomplish |
 | `instructions` | | Additional guidance, pre/post-processing hints |
 | `outputMode` | | `json` (default) or `text` |
-| `outputSchema` | | JSON schema or contract the output must satisfy |
+| `outputSchema` | | JSON schema/contract guidance for the sub-agent prompt (not strict runtime schema validation yet) |
 | `requiredKeys` | | Dot-path keys that must exist (e.g. `["summary", "items[0].url"]`) |
 | `project` | | Dot-path projection — only these fields return to parent |
 | `model` | | Model override for sub-agent (e.g. `anthropic/claude-haiku-4-5`) |
-| `thinking` | | Thinking level (`off`, `low`, `medium`, `high`) |
+| `thinking` | | Thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`) |
 | `tools` | | Tool allowlist (e.g. `["read", "grep", "find", "ls"]`) |
 | `cwd` | | Working directory for sub-agent |
 | `includeFiles` | | File paths to pass as `@file` inputs |
@@ -142,9 +142,12 @@ Total: ~$0.28, each sub-agent's full context stayed isolated.
 
 - **Isolation**: Sub-agent runs with `--no-session --no-extensions --no-skills --no-prompt-templates --no-themes`
 - **Observability**: Full execution trace in `details.trace`, debug artifact at `details.artifactPath`
-- **Safety**: Turn limits, timeouts, tool allowlists. Sub-agents can't spawn further sub-agents.
-- **Truncation**: Output truncated to Pi defaults (50KB / 2000 lines) to protect parent context
-- **Artifacts**: Debug artifact (`run.json`) written to `/tmp/pi-subagent-artifact-*/`
+- **Safety**: Turn limits, timeouts, tool allowlists, concurrency cap, and projection hardening against prototype pollution.
+- **Workspace confinement (default)**: `cwd` and `includeFiles` stay within parent workspace root. Set `PI_SUBAGENT_ALLOW_PATH_ESCAPE=1` to disable.
+- **JSON mode behavior**: Strict final-output parsing by default. Optional recovery from earlier turns via `PI_SUBAGENT_LENIENT_JSON_RECOVERY=1`.
+- **Environment handling**: Pass-through by default. Optional scrub mode: `PI_SUBAGENT_ENV_MODE=scrub` with allowlist via `PI_SUBAGENT_ENV_ALLOWLIST=KEY1,KEY2`.
+- **Truncation**: Output truncated to Pi defaults (50KB / 2000 lines) to protect parent context.
+- **Artifacts**: Debug artifact (`run.json`) written to `/tmp/pi-subagent-artifact-*` with automatic retention cleanup.
 
 ## Roadmap
 

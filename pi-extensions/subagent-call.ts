@@ -23,9 +23,12 @@ const DEFAULT_MAX_CONCURRENT_SUBAGENTS = 4;
 const MAX_ARTIFACTS = 20;
 
 const MAX_STDERR_BYTES = 64 * 1024; // 64KB cap on stderr accumulation
-const SAFE_ENV_PASSTHROUGH = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+const DEFAULT_SAFE_ENV_PASSTHROUGH = new Set(["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
 const SCRUBBED_ENV_PATTERN = /(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$/;
 const POISONED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const LENIENT_JSON_RECOVERY = process.env.PI_SUBAGENT_LENIENT_JSON_RECOVERY === "1";
+const ENFORCE_WORKSPACE_CONFINEMENT = process.env.PI_SUBAGENT_ALLOW_PATH_ESCAPE !== "1";
+const SUBAGENT_ENV_MODE: "passthrough" | "scrub" = process.env.PI_SUBAGENT_ENV_MODE === "scrub" ? "scrub" : "passthrough";
 
 let activeSubagentProcesses = 0;
 
@@ -77,7 +80,7 @@ const SubagentCallParams = Type.Object({
 		}),
 	),
 	timeoutSeconds: Type.Optional(
-		Type.Number({
+		Type.Integer({
 			description: "Hard timeout for sub-agent execution",
 			default: DEFAULT_TIMEOUT_SECONDS,
 			minimum: 5,
@@ -85,7 +88,7 @@ const SubagentCallParams = Type.Object({
 		}),
 	),
 	maxTurns: Type.Optional(
-		Type.Number({
+		Type.Integer({
 			description: "Maximum assistant turns for the sub-agent before forced stop",
 			default: DEFAULT_MAX_TURNS,
 			minimum: 1,
@@ -174,21 +177,32 @@ function pushTrace(trace: TraceItem[], item: TraceItem): void {
 	if (trace.length > MAX_TRACE_ITEMS) trace.shift();
 }
 
+function assertWithinBase(baseCwd: string, resolvedPath: string, label: string): void {
+	if (!ENFORCE_WORKSPACE_CONFINEMENT) return;
+	const baseResolved = path.resolve(baseCwd);
+	const candidateResolved = path.resolve(resolvedPath);
+	const relative = path.relative(baseResolved, candidateResolved);
+	const outside = relative.startsWith("..") || path.isAbsolute(relative);
+	if (outside) throw new Error(`${label} must stay within workspace root: ${resolvedPath}`);
+}
+
 function resolveWorkingDirectory(baseCwd: string, requested?: string): string {
 	if (!requested) return baseCwd;
 	const stripped = requested.startsWith("@") ? requested.slice(1) : requested;
-	const resolved = path.isAbsolute(stripped) ? stripped : path.resolve(baseCwd, stripped);
+	const resolved = path.isAbsolute(stripped) ? path.resolve(stripped) : path.resolve(baseCwd, stripped);
+	assertWithinBase(baseCwd, resolved, "cwd");
 	if (!existsSync(resolved)) throw new Error(`cwd does not exist: ${requested}`);
 	if (!statSync(resolved).isDirectory()) throw new Error(`cwd is not a directory: ${requested}`);
 	return resolved;
 }
 
-function normalizeFileArgs(baseCwd: string, files: string[] | undefined): string[] {
+function normalizeFileArgs(workspaceRoot: string, baseCwd: string, files: string[] | undefined): string[] {
 	if (!files || files.length === 0) return [];
 	const resolved: string[] = [];
 	for (const raw of files) {
 		const stripped = raw.startsWith("@") ? raw.slice(1) : raw;
-		const abs = path.isAbsolute(stripped) ? stripped : path.resolve(baseCwd, stripped);
+		const abs = path.isAbsolute(stripped) ? path.resolve(stripped) : path.resolve(baseCwd, stripped);
+		assertWithinBase(workspaceRoot, abs, "includeFiles path");
 		if (!existsSync(abs)) throw new Error(`includeFiles path does not exist: ${raw}`);
 		if (!statSync(abs).isFile()) throw new Error(`includeFiles entry is not a file: ${raw}`);
 		resolved.push(abs);
@@ -309,8 +323,10 @@ function getDotPathValue(source: unknown, dotPath: string): unknown {
 	const parts = normalized.split(".").filter(Boolean);
 	let current: any = source;
 	for (const part of parts) {
+		if (POISONED_KEYS.has(part)) return undefined;
 		if (current === null || current === undefined) return undefined;
 		if (typeof current !== "object") return undefined;
+		if (!Object.prototype.hasOwnProperty.call(current, part)) return undefined;
 		current = current[part];
 	}
 	return current;
@@ -341,7 +357,7 @@ function setDotPathValue(target: Record<string, any>, dotPath: string, value: un
 
 function projectObject(source: unknown, paths: string[] | undefined): unknown {
 	if (!paths || paths.length === 0) return source;
-	const projected: Record<string, any> = {};
+	const projected: Record<string, any> = Object.create(null) as Record<string, any>;
 	for (const p of paths) {
 		const value = getDotPathValue(source, p);
 		if (value !== undefined) setDotPathValue(projected, p, value);
@@ -453,10 +469,19 @@ function formatUsage(usage: UsageStats): string {
 }
 
 function buildSubagentEnv(): NodeJS.ProcessEnv {
+	if (SUBAGENT_ENV_MODE === "passthrough") return { ...process.env };
+
+	const allowlist = new Set(DEFAULT_SAFE_ENV_PASSTHROUGH);
+	const extraAllowlist = (process.env.PI_SUBAGENT_ENV_ALLOWLIST ?? "")
+		.split(",")
+		.map((key) => key.trim())
+		.filter(Boolean);
+	for (const key of extraAllowlist) allowlist.add(key);
+
 	const env: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) {
 		if (value === undefined) continue;
-		if (SCRUBBED_ENV_PATTERN.test(key) && !SAFE_ENV_PASSTHROUGH.has(key)) continue;
+		if (SCRUBBED_ENV_PATTERN.test(key) && !allowlist.has(key)) continue;
 		env[key] = value;
 	}
 	return env;
@@ -483,6 +508,42 @@ function findJsonInAssistantOutputs(outputs: string[]): { value?: unknown; sourc
 	return { error: latestError ?? "Sub-agent returned empty output; expected JSON" };
 }
 
+function parseJsonOutput(outputs: string[], allowLenientRecovery: boolean): {
+	value?: unknown;
+	sourceText: string;
+	error?: string;
+	recovered: boolean;
+} {
+	const lastOutput = outputs[outputs.length - 1]?.trim() ?? "";
+	const strict = extractJsonPayload(lastOutput);
+	if (!strict.error) {
+		return { value: strict.value, sourceText: lastOutput, recovered: false };
+	}
+
+	if (!allowLenientRecovery) {
+		return {
+			error: strict.error,
+			sourceText: lastOutput,
+			recovered: false,
+		};
+	}
+
+	const recovered = findJsonInAssistantOutputs(outputs);
+	if (!recovered.error) {
+		return {
+			value: recovered.value,
+			sourceText: recovered.sourceText ?? lastOutput,
+			recovered: true,
+		};
+	}
+
+	return {
+		error: strict.error ?? recovered.error,
+		sourceText: lastOutput,
+		recovered: false,
+	};
+}
+
 async function runSubagent(
 	params: {
 		cwd: string;
@@ -496,7 +557,9 @@ async function runSubagent(
 		taskPrompt: string;
 	},
 	signal: AbortSignal | undefined,
-	onUpdate: ((update: any) => void) | undefined,
+	onUpdate:
+		| ((update: { content?: Array<{ type: "text"; text: string }>; details?: Record<string, unknown> }) => void)
+		| undefined,
 ): Promise<RunResult> {
 	const usage: UsageStats = {
 		input: 0,
@@ -716,8 +779,6 @@ function cleanupOldArtifacts(maxArtifacts: number): void {
 function writeArtifact(run: {
 	params: SubagentCallParams;
 	resolvedCwd: string;
-	systemPrompt: string;
-	taskPrompt: string;
 	result: RunResult;
 	processedOutput?: unknown;
 	parseError?: string;
@@ -806,7 +867,18 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			const includeFiles = normalizeFileArgs(resolvedCwd, params.includeFiles);
+
+			let includeFiles: string[];
+			try {
+				includeFiles = normalizeFileArgs(ctx.cwd, resolvedCwd, params.includeFiles);
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : "Invalid includeFiles";
+				return {
+					content: [{ type: "text", text: `Sub-agent rejected: ${msg}` }],
+					details: { status: "error", errorMessage: msg },
+					isError: true,
+				};
+			}
 			const tools = normalizeTools(params.tools);
 
 			const systemPrompt = buildSystemPrompt({
@@ -906,8 +978,8 @@ export default function (pi: ExtensionAPI) {
 			let processedOutput: unknown;
 
 			if (outputMode === "json") {
-				const parsed = findJsonInAssistantOutputs(run.assistantOutputs);
-				const matchedOutput = parsed.sourceText ?? lastOutput;
+				const parsed = parseJsonOutput(run.assistantOutputs, LENIENT_JSON_RECOVERY);
+				const matchedOutput = parsed.sourceText || lastOutput;
 				if (parsed.error) {
 					parseError = parsed.error;
 					isError = true;
@@ -927,8 +999,11 @@ export default function (pi: ExtensionAPI) {
 						contentText = [
 							"Sub-agent JSON output is missing required keys.",
 							`Missing: ${missingKeys.join(", ")}`,
+							parsed.recovered ? "Warning: JSON was recovered from an earlier assistant turn." : undefined,
 							`Raw output:\n${matchedOutput || "(no output)"}`,
-						].join("\n\n");
+						]
+							.filter(Boolean)
+							.join("\n\n");
 					} else {
 						processedOutput = projectObject(parsed.value, params.project);
 						contentText = JSON.stringify(processedOutput, null, 2);
@@ -983,8 +1058,6 @@ export default function (pi: ExtensionAPI) {
 			const artifactPath = writeArtifact({
 				params,
 				resolvedCwd,
-				systemPrompt,
-				taskPrompt,
 				result: run,
 				processedOutput,
 				parseError,
